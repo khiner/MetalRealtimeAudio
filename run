@@ -1,17 +1,17 @@
 #!/bin/bash
-# Builds and runs the dispatch latency probe, forwarding arguments to it.
-#   ./run [frames] [iters] [submit_period_ms] [depth] [keepalive_ms]
-#   ./run                     # 128-frame blocks at their real 48k cadence, fastest settings
-#   ./run 512                 # every default follows the frame count
-#   ./run 128 4000 0          # back-to-back hot loop, which no audio pipeline can reach
-#   ./run 128 4000 2.667 1 0  # unpipelined, cold-GPU baseline
+# Builds and runs the GPU audio pipeline, forwarding arguments to it.
+#   ./run [frames] [seconds] [depth] [keepalive_ms] [voices]
+#   ./run                     # 32-frame blocks, 10 s, depth 2, the lowest latency that measures clean
+#   ./run 32 20 1             # one less block of lookahead, but glitches about once in 150k blocks
+#   ./run 128 10 2 0.25 4096  # 4096 voices summed per sample
+
 set -e
 cd "$(dirname "$0")"
 Llvm=$(brew --prefix llvm)
 mkdir -p build
 "$Llvm/bin/clang++" -std=c++23 -stdlib=libc++ -fblocks -O2 -Wall -Wextra \
     -isysroot "$(xcrun --show-sdk-path)" -mmacosx-version-min=26.0 -Ilib/metal-cpp \
-    -framework Metal -framework Foundation -framework QuartzCore \
+    -framework Metal -framework Foundation -framework QuartzCore -framework CoreAudio \
     -L"$Llvm/lib/c++" -Wl,-rpath,"$Llvm/lib/c++" \
-    src/DispatchLatency.cpp -o build/DispatchLatency
-exec build/DispatchLatency "$@"
+    src/GpuAudio.cpp -o build/GpuAudio
+exec build/GpuAudio "$@"
