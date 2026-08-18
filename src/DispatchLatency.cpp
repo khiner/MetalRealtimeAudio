@@ -2,11 +2,15 @@
 // GPU-generated realtime audio. Per dispatch: CPU encode, commit to GPU start, GPU execution, and
 // commit to GPU end, the per-block latency that stays valid at any depth.
 //
-//   DispatchLatency [frames] [iters] [submit_period_ms] [depth] [keepalive_ms]
+//   DispatchLatency [frames] [iters] [submit_period_ms] [depth] [keepalive_ms] [voices]
 //
 // Period defaults to the cadence the frame count implies, and 0 submits back to back. Depth is how
 // many dispatches stay in flight. Keepalive submits a one-thread filler dispatch on its own period,
 // which stops the GPU idling between blocks and is worth about 5x at audio cadences.
+//
+// Voices is how many sines each output sample sums, which is the load knob. One threadgroup per
+// frame splits the voices across its threads and reduces, so occupancy scales with voices rather
+// than being capped at one thread per frame.
 //
 // Completion is an MTLSharedEvent signalled on the queue and polled, so a realtime consumer never
 // touches a dispatch queue. MTL4CommitFeedback is collected too, but only for its GPU timestamps.
@@ -39,18 +43,31 @@ constexpr auto SineSource = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-struct Params { float PhaseInc, Phase0; uint Seq; };
+struct Params { float PhaseInc, Phase0; uint Seq, Voices; };
 
 kernel void Sine(
     device float *out [[buffer(0)]], constant Params &p [[buffer(1)]], device uint *witness [[buffer(2)]],
-    uint i [[thread_position_in_grid]]
+    uint frame [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],
+    uint lanes [[threads_per_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]
 ) {
-    out[i] = sin(fma(p.PhaseInc, float(i), p.Phase0));
-    witness[i] = p.Seq; // exact, so the visibility check cannot be confused with float precision
+    float sum = 0;
+    for (uint v = lane; v < p.Voices; v += lanes) sum += sin(fma(p.PhaseInc * float(v + 1), float(frame), p.Phase0));
+
+    threadgroup float partials[32]; // one per simdgroup, and a threadgroup is at most 1024 threads
+    sum = simd_sum(sum);
+    if (simd_lane == 0) partials[simd_id] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float total = 0;
+        for (uint k = 0; k < (lanes + 31) / 32; ++k) total += partials[k];
+        out[frame] = total / float(p.Voices);
+        witness[frame] = p.Seq; // exact, so the visibility check cannot be confused with float precision
+    }
 }
 )";
 
-struct Params { float PhaseInc, Phase0; uint32_t Seq; };
+struct Params { float PhaseInc, Phase0; uint32_t Seq, Voices; };
 
 // One dispatch's timings, all in seconds.
 struct Timings { double Encode, Submit, Exec, Done, Ready; };
@@ -101,6 +118,7 @@ int main(int argc, char **argv) {
     // The fastest configuration measured. Pass 1 and 0 for the unpipelined, cold-GPU baseline.
     const int depth = args.size() > 4 ? std::atoi(args[4]) : 2;
     const double keepalive = args.size() > 5 ? std::atof(args[5]) * 1e-3 : 0.25e-3; // seconds, 0 to disable
+    const uint32_t voices = args.size() > 6 ? uint32_t(std::atoi(args[6])) : 1; // sines summed per output sample
 
     auto device = NS::TransferPtr(MTL::CreateSystemDefaultDevice());
     NS::Error *error{};
@@ -122,7 +140,7 @@ int main(int argc, char **argv) {
     // 1.3 us more per encode than rotating, so the floor stays 4 regardless of depth.
     const uint32_t SlotCount = std::max(4, depth + 2);
     auto samples = NS::TransferPtr(device->newBuffer(frames * SlotCount * sizeof(float), MTL::ResourceStorageModeShared));
-    auto params = NS::TransferPtr(device->newBuffer(SlotCount * sizeof(Params), MTL::ResourceStorageModeShared));
+    auto params = NS::TransferPtr(device->newBuffer((SlotCount + 1) * sizeof(Params), MTL::ResourceStorageModeShared)); // one extra for the filler
     auto witness = NS::TransferPtr(device->newBuffer(frames * SlotCount * sizeof(uint32_t), MTL::ResourceStorageModeShared));
 
     // Metal 4 has no implicit residency tracking, so resources go in a set attached to the queue.
@@ -152,7 +170,10 @@ int main(int argc, char **argv) {
     auto *slot_params = static_cast<Params *>(params->contents());
     const auto samples_address = samples->gpuAddress(), params_address = params->gpuAddress();
     const auto witness_address = witness->gpuAddress();
-    const auto threads_per_group = std::min(frames, uint32_t(pipeline->maxTotalThreadsPerThreadgroup()));
+    // A threadgroup per frame, sized to the voice count so the whole GPU is used rather than one
+    // thread per frame. Rounded to a simdgroup, since the reduction below works in simdgroups.
+    const auto max_threads = uint32_t(pipeline->maxTotalThreadsPerThreadgroup());
+    const auto threads_per_group = std::clamp((voices + 31) / 32 * 32, 32u, max_threads);
 
     // Signalled on the queue timeline, so completion is what makes the writes visible. Publishing a
     // flag from inside the kernel is faster and is not safe, which the stale counter below proves.
@@ -160,7 +181,10 @@ int main(int argc, char **argv) {
     const auto *cpu_witness = static_cast<const volatile uint32_t *>(witness->contents()); // volatile, so a stale read is the GPU's and not the optimizer's
     int stale = 0;
 
-    // Its own allocator and buffer, so filler never disturbs the rotation the measured blocks use.
+    // Its own allocator, buffer and params, so filler never disturbs the rotation the measured blocks
+    // use and stays one thread of one voice however heavy the measured load gets. Sharing the bound
+    // params instead makes the filler scale with the voice count and swamp the queue.
+    slot_params[SlotCount] = {.PhaseInc = 0, .Phase0 = 0, .Seq = 0, .Voices = 1};
     auto warm_allocator = NS::TransferPtr(device->newCommandAllocator());
     auto warm_buffer = NS::TransferPtr(device->newCommandBuffer());
     const auto keep_warm = [&] {
@@ -168,9 +192,12 @@ int main(int argc, char **argv) {
         warm_buffer->beginCommandBuffer(warm_allocator.get());
         warm_buffer->useResidencySet(residency.get());
         auto *encoder = warm_buffer->computeCommandEncoder();
+        table->setAddress(samples_address, 0);
+        table->setAddress(params_address + SlotCount * sizeof(Params), 1);
+        table->setAddress(witness_address, 2);
         encoder->setArgumentTable(table.get());
         encoder->setComputePipelineState(pipeline.get());
-        encoder->dispatchThreads({1, 1, 1}, {1, 1, 1});
+        encoder->dispatchThreadgroups({1, 1, 1}, {1, 1, 1});
         encoder->endEncoding();
         warm_buffer->endCommandBuffer();
         const MTL4::CommandBuffer *list[]{warm_buffer.get()};
@@ -199,14 +226,14 @@ int main(int argc, char **argv) {
         allocators[slot]->reset();
         command_buffer->beginCommandBuffer(allocators[slot].get());
         command_buffer->useResidencySet(residency.get());
-        slot_params[slot] = {.PhaseInc = 0.01f, .Phase0 = float(i), .Seq = uint32_t(i) + 1};
+        slot_params[slot] = {.PhaseInc = 0.01f, .Phase0 = float(i), .Seq = uint32_t(i) + 1, .Voices = voices};
         table->setAddress(samples_address + slot * frames * sizeof(float), 0);
         table->setAddress(params_address + slot * sizeof(Params), 1);
         table->setAddress(witness_address + slot * frames * sizeof(uint32_t), 2);
         auto *encoder = command_buffer->computeCommandEncoder();
         encoder->setArgumentTable(table.get());
         encoder->setComputePipelineState(pipeline.get());
-        encoder->dispatchThreads({frames, 1, 1}, {threads_per_group, 1, 1});
+        encoder->dispatchThreadgroups({frames, 1, 1}, {threads_per_group, 1, 1});
         encoder->endEncoding();
         command_buffer->endCommandBuffer();
 
@@ -245,7 +272,7 @@ int main(int argc, char **argv) {
         timings[i].Submit -= commit_times[i];
     }
 
-    std::println("--- {} frames ({:.3f} ms audio @{:g}k), {} iters, period {}, depth {}, realtime {} ---", frames, frames / SampleRateKHz, SampleRateKHz, iters, period > 0 ? std::format("{:.3f} ms", period * 1e3) : "hot loop", depth, realtime ? "yes" : "NO");
+    std::println("--- {} frames ({:.3f} ms audio @{:g}k), {} voices, {} iters, period {}, depth {}, realtime {} ---", frames, frames / SampleRateKHz, SampleRateKHz, voices, iters, period > 0 ? std::format("{:.3f} ms", period * 1e3) : "hot loop", depth, realtime ? "yes" : "NO");
     Report("cpu encode", timings, &Timings::Encode);
     Report("commit -> GPU start", timings, &Timings::Submit);
     Report("GPU exec", timings, &Timings::Exec);
