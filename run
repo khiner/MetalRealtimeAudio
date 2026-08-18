@@ -1,0 +1,17 @@
+#!/bin/bash
+# Builds and runs the dispatch latency probe, forwarding arguments to it.
+#   ./run [frames] [iters] [submit_period_ms] [depth] [keepalive_ms]
+#   ./run                     # 128-frame blocks at their real 48k cadence, fastest settings
+#   ./run 512                 # every default follows the frame count
+#   ./run 128 4000 0          # back-to-back hot loop, which no audio pipeline can reach
+#   ./run 128 4000 2.667 1 0  # unpipelined, cold-GPU baseline
+set -e
+cd "$(dirname "$0")"
+Llvm=$(brew --prefix llvm)
+mkdir -p build
+"$Llvm/bin/clang++" -std=c++23 -stdlib=libc++ -fblocks -O2 -Wall -Wextra \
+    -isysroot "$(xcrun --show-sdk-path)" -mmacosx-version-min=26.0 -Ilib/metal-cpp \
+    -framework Metal -framework Foundation -framework QuartzCore \
+    -L"$Llvm/lib/c++" -Wl,-rpath,"$Llvm/lib/c++" \
+    src/DispatchLatency.cpp -o build/DispatchLatency
+exec build/DispatchLatency "$@"
