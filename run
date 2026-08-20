@@ -1,9 +1,5 @@
 #!/bin/bash
-# Builds and runs the GPU audio pipeline, forwarding arguments to it.
-#   ./run [frames] [seconds] [depth] [keepalive_ms] [voices]
-#   ./run                     # 32-frame blocks, 10 s, depth 2, the lowest latency that measures clean
-#   ./run 32 20 1             # one less block of lookahead, but glitches about once in 150k blocks
-#   ./run 128 10 2 0.25 4096  # 4096 voices summed per sample
+# Build with Homebrew LLVM and forward arguments to the GPU audio probe.
 
 set -e
 cd "$(dirname "$0")"
